@@ -6,6 +6,7 @@
   - [Prerequisites](#prerequisites)
   - [Initialize VM](#initialize-vm)
   - [Install Container Runtime](#install-container-runtime)
+  - [Install kubeadm, kubelet and kubectl](#install-kubeadm-kubelet-and-kubectl)
 
 <!--te-->
 
@@ -70,6 +71,7 @@ In this we are insalling the CRI-O on CENT OS. However, kubernetes support vario
 
 ```
 sudo -i
+sudo yum install nc -y
 export OS=CentOS_7
 export VERSION=1.27
 echo $OS
@@ -81,3 +83,41 @@ curl -L -o /etc/yum.repos.d/devel:kubic:libcontainers:stable.repo https://downlo
 curl -L -o /etc/yum.repos.d/devel:kubic:libcontainers:stable:cri-o:$VERSION.repo https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable:cri-o:$VERSION/$OS/devel:kubic:libcontainers:stable:cri-o:$VERSION.repo --verbose
 yum install cri-o -y
 ```
+
+### Install kubeadm, kubelet and kubectl
+
+You will install these packages on all of your machines:
+
+- `kubeadm`: the command to bootstrap the cluster.
+- `kubelet`: the component that runs on all of the machines in your cluster and does things like starting pods and containers.
+- `kubectl`: the command line util to talk to your cluster.
+
+kubeadm will not install or manage `kubelet` or `kubectl` for you, so you will need to ensure they match the version of the Kubernetes control plane you want kubeadm to install for you. If you do not, there is a risk of a version skew occurring that can lead to unexpected, buggy behaviour.
+
+```
+cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-\$basearch
+enabled=1
+gpgcheck=1
+gpgkey=https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+exclude=kubelet kubeadm kubectl
+EOF
+
+# Set SELinux in permissive mode (effectively disabling it)
+sudo setenforce 0
+sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+
+sudo yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+
+sudo systemctl enable --now kubelet
+```
+
+Notes:
+
+- Setting SELinux in permissive mode by running setenforce 0 and sed ... effectively disables it. This is required to allow containers to access the host filesystem, which is needed by pod networks for example. You have to do this until SELinux support is improved in the kubelet.
+
+- You can leave SELinux enabled if you know how to configure it but it may require settings that are not supported by kubeadm.
+
+- If the `baseurl` fails because your Red Hat-based distribution cannot interpret `basearch`, replace `\$basearch` with your computer's architecture. Type `uname -m` to see that value. For example, the baseurl URL for `x86_64` could be: `https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64`.
