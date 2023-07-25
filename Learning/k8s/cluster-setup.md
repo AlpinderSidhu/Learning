@@ -5,6 +5,7 @@
 - Setup Steps
   - [Prerequisites](#prerequisites)
   - [Initialize VM](#initialize-vm)
+  - [Install Container Runtime](#install-container-runtime)
 
 <!--te-->
 
@@ -46,3 +47,37 @@ Initialize 3 VMs and assign static IPs to them
 > ```
 > gcloud compute instances create kubenode2 --project=temporal-kube-393320 --zone=us-central1-a --machine-type=e2-medium --network-interface=private-network-ip=10.128.0.8,stack-type=IPV4_ONLY,subnet=default,no-address --maintenance-policy=MIGRATE --provisioning-model=STANDARD --service-account=542149362096-compute@developer.gserviceaccount.com --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/trace.append --tags=http-server,https-server --create-disk=auto-delete=yes,boot=yes,device-name=kubemaster1,image=projects/centos-cloud/global/images/centos-7-v20230711,mode=rw,size=20,type=projects/temporal-kube-393320/zones/us-central1-a/diskTypes/pd-balanced --no-shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring --labels=goog-ec-src=vm_add-gcloud --reservation-affinity=any
 > ```
+
+Upon creating nodes. Go to `VPC Networks` to create the `static` IP addresses.
+
+#### Create NAT
+
+NAT is required to connect the internal VMs to the internet to download the container runtime. To create NAT.
+
+- Navigate to `Cloud NAT` service
+- Click on `CREATE CLOUD NAT GATEWAY` and add the required details.
+
+### Install Container Runtime (CRI-O)
+
+In this we are insalling the CRI-O on CENT OS. However, kubernetes support various container runtimes:
+
+- containerd
+- CRI-O
+- Docker Engine
+- Mirantis Container Runtime
+
+1. Install container runtime on each node of the cluster. To install CRI-O, execute following commands.
+
+```
+sudo -i
+export OS=CentOS_7
+export VERSION=1.27
+echo $OS
+echo $VERSION
+```
+
+```
+curl -L -o /etc/yum.repos.d/devel:kubic:libcontainers:stable.repo https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/devel:kubic:libcontainers:stable.repo --verbose
+curl -L -o /etc/yum.repos.d/devel:kubic:libcontainers:stable:cri-o:$VERSION.repo https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable:cri-o:$VERSION/$OS/devel:kubic:libcontainers:stable:cri-o:$VERSION.repo --verbose
+yum install cri-o
+```
