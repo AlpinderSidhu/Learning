@@ -1,0 +1,488 @@
+using DataReader.Common.Configuration.Services;
+using DataReader.Domain.Models;
+using DataReader.Domain.Models. Logging;
+using DataReader.Domain.Source;
+using DataReader.Logging.Interfaces;
+using DataReader.Logic.Core;
+using DataReader.Logic.Interfaces;
+using DataReader.Reconciliation.Models;
+using Microsoft.Extensions.Options;
+using Newtonsoft.Json;
+
+namespace DataReader.Reconciliation.Services
+{
+    public class ReconciliationService : IReconciliationService
+    {
+        private readonly ILogger<Worker> _logger;
+        private readonly IOperationalLogger _operationallogger;
+        private readonly CorrelationService_ correlationService;
+        private readonly IConfigurationService _configurationService;
+        private Tenant _tenantConfig;
+        private readonly IBigQueryService _bigQueryService;
+        private readonly IReaderStrategyFactory<BaseReaderModel> strategy Factory;
+
+        public ReconciliationService (ILogger<Worker> logger, I0ptions<Tenant> tenantOptions,
+        ConfigurationService configurationService,
+        IBigQueryService bigQueryService, IReaderStrategyFactory<BaseReaderModel› strategyFactory,
+        OperationalLogger operationalLogger,
+        CorrelationService correlationService)
+        {
+            logger = logger;
+            _operationalLogger = operationalLogger;
+            correlationService = correlationService;
+            _configurationService = configurationService;
+            tenantConfig = tenantOptions .Value;
+            _bigQueryService = bigQueryService;
+            _strategyFactory = strategyFactory;
+        }
+        
+        public async Task Start ()
+        {
+            _tenantConfig = await EnhanceTenantConfig(_tenantConfig) ;
+            
+            var biqQueryData = await GetBigQueryValidationData(cancellationToken.None);
+            
+            var sourceList = BuildSourceList(_tenantConfig DataSource);
+            
+            List<DataReaderQuery> queries = new List<DataReaderQuery> ();
+            foreach (var query in sourceList)
+            {
+                if (queries.Any() && queries.Last().DataSource != query.DataSource)
+                {
+                await ProcessQuery(queries, biqQueryData);
+                queries.Clear();
+                }
+                
+                queries.Add(query);
+            }
+            
+            if (queries.Any())
+            {
+                await ProcessQuery(queries, biqQueryData);
+            }
+            
+            _logger.LogInformation($"Finished reconciliation for tenant={_tenantConfig.Name}");
+        }
+        
+        private async Task<List<BigQueryValidationData>> GetBigQueryValidationData()
+        {
+            if (!_tenantConfig.DataSource.Queries.Any()) return new List<BigQueryValidationData>();
+            var query = _tenantConfig. DataSource.Queries.First();
+            return await GetValidationData(query.BigQueryTable, query.ReconciliationColumn);
+        }
+        
+        private async Task ProcessQuery (List<DataReaderQuery> itemGroup,
+        List<BigQueryValidationData> bigQueryValidation)
+        {
+            if (!itemGroup.Any()) return;
+            var item = itemGroup.First();
+            if (string.IsNullOrEmpty(item.DataSource) ||
+                string.IsNullOrEmpty(item.ReconciliationColumn) ||
+                string.IsNullOrEmpty(item.BigQueryTable))
+                throw new ArgumentException("Missing source/destination for reconciliation check");
+            
+            var query = DataQueryService.BuildCommand(item, _tenantConfig.DataSource.DataReaderStrategyEnum);
+            try
+            {
+                logger.LogInformation("Starting reconciliation for {datasource} with {count} items", query.Datasource, itemGroup.Count);
+                SetCorrelationParameters(query);
+               _operationalLogger.LogInfo(new OperationalLog
+                { EventType = OperationaleventType.RECONCILIATION_START });
+                
+                var bigQuery = bigQueryValidation
+                    .Where(x => x.Source.Equals(query.DataSource, StringComparison.InvariantCultureIgnoreCase))
+                    .FirstOrDefault() ?? new BigQueryValidationData
+                    { CountTotal = 0, CountDistinct = 0, CountReconciliation = 0 };
+
+                var columnCountBigQuery = GetColumnCount(bigQuery);
+                
+                var (checkedRows, succeededRows, bigQueryRows) = await ValidateSampleData(query, itemGroup, bigQuery.Data);
+                
+                _logger.LogInformation("Sampling data validated for {source}", query.DataSource) :
+
+                var (rowCountSource, rowCountReconciliationSource, columnCountSource) = 
+                await ReadSourceValidationData(_tenantConfig.DataSource, itemGroup);
+                
+                logger.LogInformation("Count data validated for {source}", query DataSource);
+                
+                var isSuccess = rowCountSource == bigQuery.CountTotal &&
+                                bigQuery.CountTotal == bigQuery.CountDistinct && 
+                                bigQuery.CountReconciliation == rowCountReconciliationSource &&
+                                columnCountSource == columnCountBigQuery &&
+                                checkedRows == succeededRows && checkedRows == bigQueryRows; 
+                var logMessage =
+                $"Validation finished with {(isSuccess ? "success" : "errors")} for tenant={_tenantConfig.Name}, source = '{query Datasource}'." +
+                $"Total row count matched {bigQuery.CountTotal == rowCountSource}" +
+                $"(BQ total: {bigQuery.CountTotal), BQ distinct insertId: {bigQuery.CountDistinct}, source: {rowCountSource})-" +
+                $"Row count matched for distinct reconciliation column '{query. ReconciliationColumn}' {bigQuery.CountReconciliation==rowCountReconciliationSource}"+
+                $"(BQ: {bigQuery.CountReconciliation}, source:{rowCountReconciliationSource}) - " +
+                $"column count matched {columnCountBigQuery == columnCountSource} (BQ: {columnCountBigQuery} - source: {columnCountSource})";
+                $"Row validation matched {checkedRows == succeededRows && checkedRows == bigQueryRows} (Checked: {checkedRows} rows - Succeeded: {succeededRows} - BigQuery:{bigQueryRows} rows (ignored columns {String.Join(", ", query ReconciliationIgnoreColumns)})"
+
+                if (isSuccess)
+                {
+                    _logger.LogInformation(logMessage);
+                    _operationalLogger.LogInfo(new OperationalLog
+                            { EventType = OperationalEventType.RECONCILIATION_SUCCESS, Message = logMessage });
+                }
+                else
+                {
+                    _logger.LogError(logMessage);
+                    _operationalLogger.LogError(new OperationalLog
+                        { EventType = OperationalEventType.RECONCILIATION_ERROR, Message = logMessage });    
+                } 
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError( ex,
+                    $"Validation crashed for tenant={_tenantConfig.Name], source = '{query.DataSource}': {ex}",
+                    ex);
+                    _operationalLogger.LogError(new OperationalLog
+                        { EventType = OperationalEventType.RECONCILIATION_ERROR, Exception = ex.ToString() });
+            }
+        }
+        
+        private async Task<(int checkedrows, int succeededRows, int bigQueryRows)> ValidateSampleData(DataReaderQuery dataReaderQuery, List<DataReaderQuery> itemGroup, string[]? bigQueryData)
+        {
+            logger.LogInformation("Validating sample data for {countItems} items, {countBQ} BQ data and source {source}", itemGroup.Count, bigQueryData?.Length, dataReaderQuery.Datasource);
+            if (bigQueryData == null || bigQueryData. Length == 0) return (0, 0, 0);
+
+            var reconciliationColumn = dataReaderQuery.ReconciliationColumn!.ToLower();
+            var validationRowsBigQuery = bigQueryData.Select(JsonToDictionary).ToList();
+            var keys = validationRowsBigQuery?.Select(x => x?[reconciliationColumn]).ToList();
+            var checkedRows = 0;
+            var succeededRows = 0;
+            var ignoreCols = dataReaderQuery.ReconciliationIgnoreColumns.Select(x => x.ToLower()).ToList();
+            var bigQueryRows = validationRowsBigQuery?.Count ?? 0;
+            foreach (var item in itemGroup)
+            {
+                if (checkedRows != bigQueryRows)
+                {
+                    var query = BuildReconciliationSampleCommand(dataReaderQuery.DataSource, item, keys, reconciliationColumn, _tenantConfig.DataSource.DataReaderStrategyEnum);
+                    await foreach (var x in _strategyFactory.ReadData(_tenantConfig.Datasource, query, bigQueryRows))
+                    {
+                        checkedRows++;
+                        var reconciliationValue = x.Payload![reconciliationColumn] as string;
+                        var biqQueryRow = validationRowsBigQuery?.Where(y => y! [reconciliationColumn].Equals(reconciliationValue, StringComparison.OrdinalIgnoreCase)).FirstOrDefault();
+                        if (bigQueryRow != null)
+                        {
+                            var equal = true;
+                            var columnsNotMatched = new List<string> ();
+                            foreach (var (key, valueSource) in x.Payload)
+                            {
+                                if (!ignoreCols.Contains(key))
+                                {
+                                    if (biqQueryRow.TryGetValue(key, out var valueBq))   
+                                    {
+                                        var equalCol = false;
+                                        if (valueBq == null && valuesource == null)
+                                        {
+                                            equalCol = true;
+                                        }                                        
+                                        else if (valueSource != null)
+                                        {
+                                            equalCol = valueSource.Equals(valueBq);
+                                        }
+
+                                        equal &= equalcol:
+                                        if (!equalCol)
+                                        {
+                                            columnsNotMatched.Add($"{key} BQ: {valueBq}, Source: {valuesource}");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        columnsNotMatched.Add ($"{key} BQ: [value not found in BQ], Source: {valueSource}");
+                                        equal = false;
+                                    }
+                                }
+                            }
+                            
+                            if (equal)
+                            {
+                                succeededRows++;
+                            }
+                            else
+                            {
+                                _logger.LogError ("Columns didn't match for '{key}': '{diff}'", reconciliationValue, String.Join(",", columnsNotMatched));
+                            }              
+                        }
+                        else
+                        {
+                            logger.LogError ("Row not found in BQ for {column} : {value}'", reconciliationColumn, reconciliationValue);
+                        }
+                    }
+                }
+            }
+
+            _logger.LogInformation($"Validating sample data Method finished {checkedRows}, {succeededRows}, {bigQueryRows}");
+            return (checkedRows, succeededRows, bigQueryRows);
+        }
+
+        private long GetColumnCount(BigQueryValidationData bigQuery)
+        {
+            if (String.IsNullOrEmpty(bigQuery.Data)) return 0;
+            return JsonConvert.DeserializeObject<Dictionary<string, string>> (bigQuery.Data)?.Count ?? -1;
+        }
+        
+        private void SetCorrelationParameters(DataReaderQuery query)
+        {
+            _correlationService.Set (new CorrelationDto
+            {
+                Tenant = _tenantConfig.Name,
+                DataSourceType = _tenantConfig.DataSource.DataReaderStrategyEnum.Tostring(),
+                DataQuery = query.DataSource,
+                DataSource = query.DataSource
+                });
+                }
+                
+                private async Task<(long, long, long)> ReadSourceValidationData(DataReaderSource tenantDataSource,
+                List<DataReaderQuery> itemGroup)
+                {
+                    long rowCount = 0;
+                    long rowCountReconciliation = 0;
+                    int columnCount = 0;
+                    
+                    foreach (var item in itemGroup)
+                    {
+                        var subQuery =
+                        DataQueryService.BuildReconciliationCommand(item, _tenantConfig.DataSource.DataReaderStrategyEnum);
+                        await foreach(var x in _strategyFactory.ReadData(tenantDataSource, subQuery, 1))
+                        {
+                            x.Payload.TryGetValue("counter", out var rowCountAsObject);
+                            rowCount += Int64.Parse(rowCountAsObject.ToString());
+                            x.Payload.TryGetValue("counterdistinct", out var rowCountReconciliationAsObject);
+                            rowCountReconciliation += Int64.Parse(rowCountReconciliationAsObject.ToString());
+                            }
+                            }
+                            
+                            var topOneQuery = DataQueryService.BuildTopOneCommand(itemGroup.First(),
+                            _tenantConfig.DataSource.DataReaderStrategyEnum);
+                            await foreach (var x in _strategyFactory. ReadData(tenantDatasource,
+                            topOneQuery,
+                            1))
+                            {
+                                columnCount = X.Payload.Count;
+                            }
+                            
+                            return (rowCount, rowCountReconciliation, columnCount);
+            }
+            }
+            }
+            
+//
+    public async Task<Tenant> EnhanceTenantConfig(Tenant tenantConfig)
+    {
+    if (!string. IsNul10rWhiteSpace(tenantConfig.DataSource.ConnectionStringSecretId))
+    tenantConfig.DataSource.ConnectionString= await GetSecret(tenantConfig .DataSource. ConnectionStringSecretId);
+    return tenantConfig;
+    }
+
+    public static List<DataReaderQuery> BuildSourceList (DataReaderSource config)
+    {
+        var result = new List<DataReaderQuery> ();
+        if (!config.Databases.Any())
+        {
+            result.AddRange (config.Queries);
+            }
+            else{
+                foreach (var database in config.Databases)
+                {
+                    foreach (var query in config.Queries){
+                        var item = query.Clone();
+                        item.DataSource = $"{database}.{item.DataSource}";
+                        if (!string.IsNullOrWhiteSpace(item.Command) &&
+                        item.Command.Contains(Consts.Placeholders.DATABASE))
+                        item.Command = item.Command.Replace(Consts.Placeholders.DATABASE, database);
+                        result.Add(item);
+                    }
+                }
+            }
+            return config.RandomizeQueryOrder ? result.OrderBy(a => Guid.NewGuid()).ToList() : result;
+    }
+
+        // TODO: if recon works with a single query, use this method
+        public static DataReaderQuery BuildReconciliationCommand (DataReaderQuery input,
+        DataReaderStrategyEnum readerType)
+        {
+            var query = input.Clone();
+            switch (readerType)
+            {
+                case DataReaderStrategyEnum.ORACLE:
+                {
+                    query.IncludedColumns = new List<string>()
+                    {
+                        "COUNT(*) as counter", $"COUNT(DISTINCT({query ReconciliationColumn})) as counterdistinct"
+                    };
+                    query = BuildCommand(query, DataReaderStrategyEnum.SQL);
+                    break;
+                }
+                case DataReaderStrategyEnum.SYBASE:
+                case DataReaderStrategyEnum.SQL:
+                {
+                    query.IncludedColumns = new List<string> ()
+                    {
+                    "COUNT_BIG(*) as counter",
+                    $"COUNT_ BIG(DISTINCT ({query.ReconciliationColumn})) as counterdistinct"
+                    };
+                    query = BuildCommand(query, DataReaderStrategyEnum.SQL);
+                    break;
+                }
+            }   
+            return query;
+        }
+        
+
+    public static DataReaderQuery BuildCommand(DataReaderQuery input, DataReaderStrategyEnum readerType)
+    {
+        var query = input.Clone();
+        switch (readerType)
+        {
+            case DataReaderStrategyEnum.ORACLE:
+            case DataReaderStrategyEnum.SQL:
+            case DataReaderStrategyEnum.SYBASE:
+            case DataReaderStrategy Enum.POSTGRESQL:
+            {
+            query = BuildSQLQuery(query);
+            break;
+            }
+            case DataReaderStrategyEnum.NFS:
+            break;
+            case DataReaderStrategyEnum.EXCEL:
+            break;
+        }
+        return query;
+    }
+    
+    
+    private static DataReaderQuery BuildSQLQuery(DataReaderQuery query)
+    {
+        query.Command = !string.IsNullOrEmpty(query.Command)
+        ? query.Command
+        BuildSQLCommand (query);
+        return query;
+    }
+
+}
+    private static string BuildSQLCommand(DataReaderQuery query)
+    {
+        var columns = query.IncludedColumns.Any()
+        ? string.Join(", ", query.IncludedColumns)
+        : "*";
+        var command = $"SELECT {columns} FROM {query.DataSource}";
+        if (query.FilterConditions.Any())
+            command = $"{command} WHERE {string.Join(" AND ", query.FilterConditions)}";
+            return command.Trim();
+    }
+
+
+// BigQuery Service
+using System.Diagnostics;
+using DataReader .Common. Configuration;
+using DataReader. Reconciliation.Models;
+using Google.Cloud.BigQuery.V2;
+using Microsoft.Extensions .Options;
+
+namespace DataReader. Reconciliation.Services
+{
+    class BigQueryService : IBigQueryService
+    {
+        private readonly ILogger<BigQueryService> _logger;
+        private readonly BigQueryClient _client;
+
+        public BigQueryService(ILogger<BigQueryService»logger,IOptions<ProjectOptions>projectOptions)
+        {
+            logger = logger;
+            client = File.Exists(projectOptions .Value.CertFilePath)
+            ? new BigQueryClientBuilder
+            {
+                JsonCredentials = File.ReadAllText(projectOptions .Value CertfilePath),
+                ProjectId = projectOptions.Value.ProjectId
+            }.Build()
+            : BigQueryclient.Create(projectOptions.Value.ProjectId);
+        }
+
+        public async Task<List<BigQueryValidationData> GetValidationData(string bigQueryTable, string reconciliationColum, CancellationToken cancellationToken)
+        {
+            var query = $"select source, ARRAY_AGG(data limit 100) as dataJson, count (*) as count, " +
+                        $" count (DISTINCT insertId) as countDistinct, count(DISTINCT JSON_VALUE(data,'$. {reconciliationColum.ToLower Invariant()]')) as countJson" +
+                        $"from "{bigQueryTable}" group by source;";    
+            var results = await ExecuteQuery (query, cancellationToken);
+
+            var data = new List<BigQueryValidationData>();
+            foreach (var result in results)
+            {
+                data.Add (new BigQueryValidationData()
+                {
+                    Source = result[0] as string,
+                    Data = result[1] as string[!,
+                    CountTotal = result[2] as long?,
+                    Countdistinct = result[3] as long?,
+                    Countreconciliation = result[4] as long?,
+                });
+            }
+            return data;
+        }
+
+        private async Task<BigQueryResults> ExecuteQuery (string query, CancellationToken cancellationToken) 
+        {
+        _logger. LogInformation($"Starting BigQuery job for {query}.");
+        var stopwatch = new Stopwatch();
+        stopwatch.Start();
+        var job = await _client.CreateQueryJobAsync(
+            sql: query,
+            parameters: null,
+            options: new QueryOptions { UseQueryCache - false }, cancellationToken: cancellationToken);
+
+        var result = await _client. GetQueryResultsAsync (job.Reference,
+            new GetQueryResultsOptions ()
+            {
+                Timeout - TimeSpan.FromHours(1)
+            },
+            cancellationToken);
+        stopwatch.Stop();
+        logger. LogInformation($" {stopwatch. Elapsed .Milliseconds}ms elapsed for BigQuery job {query}.");
+        return result;
+        }
+    }
+}
+
+// Stratrgy Factory code
+namespace DataReader.Logic.Factories
+{
+    public class ReaderstrategyFactory<T>: IReaderStrategyFactory<T> where T : BaseReaderModel
+    {
+        private readonly ILogger<ReaderStrategyFactory<T>> logger;
+        private readonly IEnumerable<IReaderStrategy<T>> strategyList;
+
+        public ReaderStrategyFactory(ILogger<ReaderStrategyFactory<T>>logger,
+            IEnumerable<IReaderStrategy<T>> strategyList)
+        {    
+            logger = logger;
+            _strategyList = strategyList;
+        }
+
+        public async IAsyncEnumerable<T> ReadData(DataReaderSource datasource, DataReaderQuery query, int batchSize)
+        {     
+            var dataReader = _strategyList.FirstOrDefault(x=> x.DataReaderType == dataSource. DataReaderStrategyEnum);
+            if (dataReader == null)
+                throw new ArgumentNul1Exception (nameof (dataSource.DataReaderStrategyEnum));
+
+            var sw = Stopwatch.StartNew()
+            var count = 0;
+
+            await foreach (var s in dataReader.Read(datasource, query))
+            {
+                count++;
+                if (count % batchSize == 0)
+                {
+                    logger.LogInformation(
+                        $"({sw.ElapsedMilliseconds} ms) Progress count: {count}; Command ={query.Command}");
+                    sw.Restart();
+                }
+                yield return s;
+            }
+                _logger.LogInformation($" ({sw. ElapsedMilliseconds} ms) Final count: {count}; Command = {query Command}");
+        }
+    }
+}

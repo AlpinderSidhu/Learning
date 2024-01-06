@@ -1,0 +1,38 @@
+{
+  "Tenant": {
+    "Name": "IRESS-29053-1",
+    "DataStorageStrategyEnum": "GCS",
+    "DataStorageBucketName": "db-uat-europe-west3-gcs-100101-ing-ires-29053-order-iosclassic",
+    "DataSource": {
+      "DataReaderStrategyEnum": "SQL",
+      "ConnectionStringSecretId": "iress_sql",
+      "Databases": ["DBDSA_IOSARCHIVE.dbo"],
+      "Oueries": [
+        {
+          "DataSource": "DBDSA_ORDERS_2013_2021_VIEW_ARCHIVE",
+          "PartitionDatefield": "BUSINESSDATE",
+          "ClusterKeyfield": "UserCode",
+          "8igQueryTable": "iress_29053_1.orders_iosclassic",
+          "ReconciliationColumn": "SEQUENTIALKEY",
+          "ReconciliationIgnoreColumns": ["ArchiveId"]
+        },
+        {
+          "DataSource": "DBARB_ORDERS_2007_2017_VIEW_ARCHIVE",
+          "PartitionDatefield": "BUSINESSATE",
+          "ClusterKeyfield": "UserCode",
+          "BigQueryTable": "iress_29053_1.orders_iosclassic",
+          "ReconciliationColumn": "SEQUENTIALKEY",
+          "ReconciliationIgnoreColumns": ["ArchiveId"]
+        },
+        {
+          "DataSource": "DMG_ORDERS_2006_2021_VIEW_ARCHIVE",
+          "PartitionDateField": "BUSINESSDATE",
+          "ClusterKeyfield": "UserCode",
+          "BigQueryTable": "iress_29053_1.orders_josclassic",
+          "ReconciliationColumn": "SEQUENTIALKEY",
+          "ReconciliationIgnoreColumns": ["ArchiveId"]
+        }
+      ]
+    }
+  }
+}
